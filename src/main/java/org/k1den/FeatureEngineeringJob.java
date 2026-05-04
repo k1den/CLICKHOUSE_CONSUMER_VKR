@@ -108,7 +108,7 @@ public class FeatureEngineeringJob {
         ));
 
         String clickhouseUrl = System.getenv().getOrDefault(
-                "CLICKHOUSE_URL", "jdbc:clickhouse://localhost:8123/default");
+                "CLICKHOUSE_URL", "jdbc:clickhouse://localhost:8123/default?socket_timeout=30000&connection_timeout=10000");
 
         KafkaSource<String> source = KafkaSource.<String>builder()
                 .setBootstrapServers(System.getenv().getOrDefault(
@@ -162,7 +162,7 @@ public class FeatureEngineeringJob {
                     ps.setInt(12, m.processCount);
                     ps.setDouble(13, Double.isNaN(m.cpuTemperature) ? 0.0 : m.cpuTemperature);
                 },
-                3000,
+                10000,
                 5_000L
         ));
 
@@ -179,7 +179,7 @@ public class FeatureEngineeringJob {
                             ps.setLong(5, fd.free);
                             ps.setDouble(6, fd.usedPercent);
                         },
-                        3000,
+                        10000,
                         5_000L
                 ));
 
@@ -202,7 +202,7 @@ public class FeatureEngineeringJob {
                     ps.setDouble(7, f.avgNetTx);
                     ps.setDouble(8, f.avgProcesses);
                 },
-                1000,
+                10000,
                 10_000L
         ));
 
