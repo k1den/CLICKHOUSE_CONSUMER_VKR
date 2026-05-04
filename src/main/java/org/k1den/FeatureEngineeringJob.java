@@ -102,6 +102,11 @@ public class FeatureEngineeringJob {
     public static void main(String[] args) throws Exception {
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
+        env.setRestartStrategy(org.apache.flink.api.common.restartstrategy.RestartStrategies.fixedDelayRestart(
+                3,
+                org.apache.flink.api.common.time.Time.seconds(10)
+        ));
+
         String clickhouseUrl = System.getenv().getOrDefault(
                 "CLICKHOUSE_URL", "jdbc:clickhouse://localhost:8123/default");
 
