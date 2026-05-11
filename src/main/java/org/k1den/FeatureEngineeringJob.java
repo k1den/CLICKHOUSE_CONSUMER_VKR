@@ -112,9 +112,13 @@ public class FeatureEngineeringJob {
     }
 
     public static void main(String[] args) throws Exception {
-        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
         ParameterTool params = ParameterTool.fromArgs(args);
+        String configFile = params.get("config.file", "config.properties");
+        ParameterTool config = ParameterTool.fromPropertiesFile(configFile);
+
+        String clickhouseUrl = config.get("clickhouse.url", "jdbc:clickhouse://localhost:8123/default?socket_timeout=30000&connection_timeout=10000");
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         String runMode = params.get("mode", "ALL").toUpperCase();
 
         env.setRestartStrategy(org.apache.flink.api.common.restartstrategy.RestartStrategies.fixedDelayRestart(
@@ -125,9 +129,6 @@ public class FeatureEngineeringJob {
         env.enableCheckpointing(10000, CheckpointingMode.EXACTLY_ONCE);
         env.getCheckpointConfig().setMinPauseBetweenCheckpoints(5000);
         env.getCheckpointConfig().setTolerableCheckpointFailureNumber(2);
-
-        String clickhouseUrl = System.getenv().getOrDefault(
-                "CLICKHOUSE_URL", "jdbc:clickhouse://localhost:8123/default?socket_timeout=30000&connection_timeout=10000");
 
         KafkaSource<String> source = KafkaSource.<String>builder()
                 .setBootstrapServers(System.getenv().getOrDefault(
@@ -159,6 +160,7 @@ public class FeatureEngineeringJob {
 
         DataStream<DeviceMetric> metricsStream = parsedStream.assignTimestampsAndWatermarks(
                 WatermarkStrategy.<DeviceMetric>forBoundedOutOfOrderness(Duration.ofSeconds(5))
+                        .withIdleness(Duration.ofSeconds(10))
                         .withTimestampAssigner((event, timestamp) -> event.timestamp)
         );
 
@@ -275,17 +277,24 @@ public class FeatureEngineeringJob {
     public static class DiskExtractor implements FlatMapFunction<DeviceMetric, FlatDisk> {
         @Override
         public void flatMap(DeviceMetric metric, Collector<FlatDisk> out) {
-            if (metric.disks != null) {
-                for (DiskMetric d : metric.disks) {
-                    FlatDisk fd = new FlatDisk();
-                    fd.deviceId = metric.deviceId;
-                    fd.timestamp = metric.timestamp;
-                    fd.mountPoint = d.mountPoint;
-                    fd.total = d.total;
-                    fd.free = d.free;
-                    fd.usedPercent = d.usedPercent;
-                    out.collect(fd);
+            if (metric == null || metric.disks == null) {
+                return;
+            }
+
+            for (DiskMetric d : metric.disks) {
+                if (d.usedPercent <= 0) {
+                    continue;
                 }
+
+                FlatDisk fd = new FlatDisk();
+                fd.deviceId = metric.deviceId;
+                fd.timestamp = metric.timestamp;
+                fd.mountPoint = d.mountPoint;
+                fd.total = d.total;
+                fd.free = d.free;
+                fd.usedPercent = d.usedPercent;
+
+                out.collect(fd);
             }
         }
     }
