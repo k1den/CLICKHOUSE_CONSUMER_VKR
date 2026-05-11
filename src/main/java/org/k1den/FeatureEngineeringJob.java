@@ -5,16 +5,18 @@ import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.functions.RichMapFunction;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
-import org.apache.flink.connector.jdbc.JdbcConnectionOptions;
-import org.apache.flink.connector.jdbc.JdbcExecutionOptions;
-import org.apache.flink.connector.jdbc.JdbcSink;
+import org.apache.flink.api.java.utils.ParameterTool;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
+import org.apache.flink.runtime.state.FunctionInitializationContext;
+import org.apache.flink.runtime.state.FunctionSnapshotContext;
+import org.apache.flink.streaming.api.CheckpointingMode;
+import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
 import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
-import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
@@ -27,6 +29,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -37,7 +40,7 @@ public class FeatureEngineeringJob {
         void set(PreparedStatement ps, T value) throws SQLException;
     }
 
-    public static class ClickHouseSinkFunction<T> extends RichSinkFunction<T> {
+    public static class ClickHouseSinkFunction<T> extends RichSinkFunction<T> implements CheckpointedFunction {
 
         private final String url;
         private final String sql;
@@ -87,6 +90,15 @@ public class FeatureEngineeringJob {
         }
 
         @Override
+        public void snapshotState(FunctionSnapshotContext context) throws Exception {
+            flush();
+        }
+
+        @Override
+        public void initializeState(FunctionInitializationContext context) throws Exception {
+        }
+
+        @Override
         public void finish() throws Exception {
             if (count > 0) flush();
         }
@@ -102,10 +114,17 @@ public class FeatureEngineeringJob {
     public static void main(String[] args) throws Exception {
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
+        ParameterTool params = ParameterTool.fromArgs(args);
+        String runMode = params.get("mode", "ALL").toUpperCase();
+
         env.setRestartStrategy(org.apache.flink.api.common.restartstrategy.RestartStrategies.fixedDelayRestart(
                 3,
                 org.apache.flink.api.common.time.Time.seconds(10)
         ));
+
+        env.enableCheckpointing(10000, CheckpointingMode.EXACTLY_ONCE);
+        env.getCheckpointConfig().setMinPauseBetweenCheckpoints(5000);
+        env.getCheckpointConfig().setTolerableCheckpointFailureNumber(2);
 
         String clickhouseUrl = System.getenv().getOrDefault(
                 "CLICKHOUSE_URL", "jdbc:clickhouse://localhost:8123/default?socket_timeout=30000&connection_timeout=10000");
@@ -114,7 +133,7 @@ public class FeatureEngineeringJob {
                 .setBootstrapServers(System.getenv().getOrDefault(
                         "KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
                 .setTopics("metrics")
-                .setGroupId("flink-feature-group")
+                .setGroupId("flink-feature-group-" + runMode)
                 .setStartingOffsets(OffsetsInitializer.latest())
                 .setValueOnlyDeserializer(new SimpleStringSchema())
                 .build();
@@ -122,17 +141,14 @@ public class FeatureEngineeringJob {
         DataStream<String> rawStream = env.fromSource(
                 source, WatermarkStrategy.noWatermarks(), "Kafka Source");
 
-        DataStream<DeviceMetric> metricsStream = rawStream.map(
+        DataStream<DeviceMetric> parsedStream = rawStream.map(
                 new RichMapFunction<String, DeviceMetric>() {
                     private transient ObjectMapper mapper;
 
                     @Override
                     public void open(org.apache.flink.configuration.Configuration p) throws Exception {
                         mapper = new ObjectMapper();
-                        mapper.configure(
-                                com.fasterxml.jackson.core.JsonParser.Feature.ALLOW_NON_NUMERIC_NUMBERS,
-                                true
-                        );
+                        mapper.configure(com.fasterxml.jackson.core.JsonParser.Feature.ALLOW_NON_NUMERIC_NUMBERS, true);
                     }
 
                     @Override
@@ -141,102 +157,110 @@ public class FeatureEngineeringJob {
                     }
                 });
 
-        metricsStream.addSink(new ClickHouseSinkFunction<>(
-                clickhouseUrl,
-                "INSERT INTO device_metrics (deviceId, deviceName, hostname, timestamp, " +
-                        "cpuLoad, systemLoadAverage, memoryUsedPercent, memoryTotal, memoryAvailable, " +
-                        "networkRxBytes, networkTxBytes, processCount, cpuTemperature) " +
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (ps, m) -> {
-                    ps.setString(1, m.deviceId);
-                    ps.setString(2, m.deviceName);
-                    ps.setString(3, m.hostname);
-                    ps.setLong(4, m.timestamp);
-                    ps.setDouble(5, m.cpuLoad);
-                    ps.setDouble(6, m.systemLoadAverage);
-                    ps.setDouble(7, m.memoryUsedPercent);
-                    ps.setLong(8, m.memoryTotal);
-                    ps.setLong(9, m.memoryAvailable);
-                    ps.setLong(10, m.networkRxBytes);
-                    ps.setLong(11, m.networkTxBytes);
-                    ps.setInt(12, m.processCount);
-                    ps.setDouble(13, Double.isNaN(m.cpuTemperature) ? 0.0 : m.cpuTemperature);
-                },
-                10000,
-                5_000L
-        ));
+        DataStream<DeviceMetric> metricsStream = parsedStream.assignTimestampsAndWatermarks(
+                WatermarkStrategy.<DeviceMetric>forBoundedOutOfOrderness(Duration.ofSeconds(5))
+                        .withTimestampAssigner((event, timestamp) -> event.timestamp)
+        );
 
-        metricsStream.flatMap(new DiskExtractor())
-                .addSink(new ClickHouseSinkFunction<>(
-                        clickhouseUrl,
-                        "INSERT INTO disk_metrics (deviceId, timestamp, mountPoint, total, free, usedPercent) " +
-                                "VALUES (?, ?, ?, ?, ?, ?)",
-                        (ps, fd) -> {
-                            ps.setString(1, fd.deviceId);
-                            ps.setLong(2, fd.timestamp);
-                            ps.setString(3, fd.mountPoint);
-                            ps.setLong(4, fd.total);
-                            ps.setLong(5, fd.free);
-                            ps.setDouble(6, fd.usedPercent);
-                        },
-                        10000,
-                        5_000L
-                ));
+        if (runMode.equals("RAW") || runMode.equals("ALL")) {
+            metricsStream.addSink(new ClickHouseSinkFunction<>(
+                    clickhouseUrl,
+                    "INSERT INTO device_metrics (deviceId, deviceName, hostname, timestamp, " +
+                            "cpuLoad, systemLoadAverage, memoryUsedPercent, memoryTotal, memoryAvailable, " +
+                            "networkRxBytes, networkTxBytes, processCount, cpuTemperature) " +
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ps, m) -> {
+                        ps.setString(1, m.deviceId);
+                        ps.setString(2, m.deviceName);
+                        ps.setString(3, m.hostname);
+                        ps.setLong(4, m.timestamp);
+                        ps.setDouble(5, m.cpuLoad);
+                        ps.setDouble(6, m.systemLoadAverage);
+                        ps.setDouble(7, m.memoryUsedPercent);
+                        ps.setLong(8, m.memoryTotal);
+                        ps.setLong(9, m.memoryAvailable);
+                        ps.setLong(10, m.networkRxBytes);
+                        ps.setLong(11, m.networkTxBytes);
+                        ps.setInt(12, m.processCount);
+                        ps.setDouble(13, Double.isNaN(m.cpuTemperature) ? 0.0 : m.cpuTemperature);
+                    },
+                    10000, 10_000L
+            )).name("ClickHouse Sink: RAW Metrics");
+        }
 
-        DataStream<DeviceFeature> featuresStream = metricsStream
-                .keyBy(m -> m.deviceId)
-                .window(TumblingProcessingTimeWindows.of(Time.seconds(20)))
-                .process(new FeatureCalculator());
+        if (runMode.equals("DISK") || runMode.equals("ALL")) {
+            metricsStream.flatMap(new DiskExtractor())
+                    .addSink(new ClickHouseSinkFunction<>(
+                            clickhouseUrl,
+                            "INSERT INTO disk_metrics (deviceId, timestamp, mountPoint, total, free, usedPercent) " +
+                                    "VALUES (?, ?, ?, ?, ?, ?)",
+                            (ps, fd) -> {
+                                ps.setString(1, fd.deviceId);
+                                ps.setLong(2, fd.timestamp);
+                                ps.setString(3, fd.mountPoint);
+                                ps.setLong(4, fd.total);
+                                ps.setLong(5, fd.free);
+                                ps.setDouble(6, fd.usedPercent);
+                            },
+                            10000, 10_000L
+                    )).name("ClickHouse Sink: DISK Metrics");
+        }
 
-        featuresStream.addSink(new ClickHouseSinkFunction<>(
-                clickhouseUrl,
-                "INSERT INTO metrics_features (deviceId, timestamp, avgCpuLoad, maxMemoryUsed, " +
-                        "avgCpuTemp, avgNetRx, avgNetTx, avgProcesses) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (ps, f) -> {
-                    ps.setString(1, f.deviceId);
-                    ps.setLong(2, f.windowEndTimestamp);
-                    ps.setDouble(3, f.avgCpuLoad);
-                    ps.setDouble(4, f.maxMemoryUsed);
-                    ps.setDouble(5, f.avgCpuTemp);
-                    ps.setDouble(6, f.avgNetRx);
-                    ps.setDouble(7, f.avgNetTx);
-                    ps.setDouble(8, f.avgProcesses);
-                },
-                10000,
-                10_000L
-        ));
+        if (runMode.equals("FEATURES") || runMode.equals("ALL")) {
+            DataStream<DeviceFeature> featuresStream = metricsStream
+                    .keyBy(m -> m.deviceId)
+                    .window(TumblingEventTimeWindows.of(Time.seconds(20)))
+                    .process(new FeatureCalculator());
 
-        DataStream<String> jsonFeaturesStream = featuresStream.map(
-                new RichMapFunction<DeviceFeature, String>() {
-                    private transient ObjectMapper mapper;
+            featuresStream.addSink(new ClickHouseSinkFunction<>(
+                    clickhouseUrl,
+                    "INSERT INTO metrics_features (deviceId, timestamp, avgCpuLoad, maxMemoryUsed, " +
+                            "avgCpuTemp, avgNetRx, avgNetTx, avgProcesses) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ps, f) -> {
+                        ps.setString(1, f.deviceId);
+                        ps.setLong(2, f.windowEndTimestamp);
+                        ps.setDouble(3, f.avgCpuLoad);
+                        ps.setDouble(4, f.maxMemoryUsed);
+                        ps.setDouble(5, f.avgCpuTemp);
+                        ps.setDouble(6, f.avgNetRx);
+                        ps.setDouble(7, f.avgNetTx);
+                        ps.setDouble(8, f.avgProcesses);
+                    },
+                    10000, 10_000L
+            )).name("ClickHouse Sink: FEATURES");
 
-                    @Override
-                    public void open(org.apache.flink.configuration.Configuration p) throws Exception {
-                        mapper = new ObjectMapper();
-                    }
+            DataStream<String> jsonFeaturesStream = featuresStream.map(
+                    new RichMapFunction<DeviceFeature, String>() {
+                        private transient ObjectMapper mapper;
 
-                    @Override
-                    public String map(DeviceFeature f) throws Exception {
-                        return mapper.writeValueAsString(f);
-                    }
-                });
+                        @Override
+                        public void open(org.apache.flink.configuration.Configuration p) throws Exception {
+                            mapper = new ObjectMapper();
+                        }
 
-        jsonFeaturesStream.print("FLINK ВЫДАЛ ФИЧУ");
+                        @Override
+                        public String map(DeviceFeature f) throws Exception {
+                            return mapper.writeValueAsString(f);
+                        }
+                    });
 
-        org.apache.flink.connector.kafka.sink.KafkaSink<String> kafkaSink =
-                org.apache.flink.connector.kafka.sink.KafkaSink.<String>builder()
-                        .setBootstrapServers(System.getenv().getOrDefault(
-                                "KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
-                        .setRecordSerializer(
-                                org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema.builder()
-                                        .setTopic("features_topic")
-                                        .setValueSerializationSchema(new SimpleStringSchema())
-                                        .build()
-                        ).build();
+            jsonFeaturesStream.print("FLINK ВЫДАЛ ФИЧУ");
 
-        jsonFeaturesStream.sinkTo(kafkaSink);
+            org.apache.flink.connector.kafka.sink.KafkaSink<String> kafkaSink =
+                    org.apache.flink.connector.kafka.sink.KafkaSink.<String>builder()
+                            .setBootstrapServers(System.getenv().getOrDefault(
+                                    "KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
+                            .setRecordSerializer(
+                                    org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema.builder()
+                                            .setTopic("features_topic")
+                                            .setValueSerializationSchema(new SimpleStringSchema())
+                                            .build()
+                            ).build();
 
-        env.execute("Distributed Infrastructure Feature Engineering");
+            jsonFeaturesStream.sinkTo(kafkaSink).name("Kafka Sink: Features Topic");
+        }
+
+        env.execute("Distributed Infrastructure Job [" + runMode + "]");
     }
 
     public static class FlatDisk {
