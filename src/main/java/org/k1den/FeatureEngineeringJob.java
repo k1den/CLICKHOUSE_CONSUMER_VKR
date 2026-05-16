@@ -6,15 +6,14 @@ import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.functions.RichMapFunction;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.connector.jdbc.JdbcConnectionOptions;
+import org.apache.flink.connector.jdbc.JdbcExecutionOptions;
+import org.apache.flink.connector.jdbc.JdbcSink;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
-import org.apache.flink.runtime.state.FunctionInitializationContext;
-import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.streaming.api.CheckpointingMode;
-import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
 import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
@@ -24,92 +23,11 @@ import org.k1den.dto.DeviceFeature;
 import org.k1den.dto.DeviceMetric;
 import org.k1den.dto.DiskMetric;
 
-import java.io.Serializable;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.SQLException;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 
 public class FeatureEngineeringJob {
-
-    @FunctionalInterface
-    public interface StatementSetter<T> extends Serializable {
-        void set(PreparedStatement ps, T value) throws SQLException;
-    }
-
-    public static class ClickHouseSinkFunction<T> extends RichSinkFunction<T> implements CheckpointedFunction {
-
-        private final String url;
-        private final String sql;
-        private final StatementSetter<T> setter;
-        private final int batchSize;
-        private final long flushIntervalMs;
-
-        private transient Connection conn;
-        private transient PreparedStatement ps;
-        private transient int count;
-        private transient long lastFlushTime;
-
-        public ClickHouseSinkFunction(String url, String sql, StatementSetter<T> setter,
-                                      int batchSize, long flushIntervalMs) {
-            this.url = url;
-            this.sql = sql;
-            this.setter = setter;
-            this.batchSize = batchSize;
-            this.flushIntervalMs = flushIntervalMs;
-        }
-
-        @Override
-        public void open(org.apache.flink.configuration.Configuration parameters) throws Exception {
-            conn = DriverManager.getConnection(url);
-            ps = conn.prepareStatement(sql);
-            count = 0;
-            lastFlushTime = System.currentTimeMillis();
-        }
-
-        @Override
-        public void invoke(T value, Context context) throws Exception {
-            setter.set(ps, value);
-            ps.addBatch();
-            count++;
-
-            long now = System.currentTimeMillis();
-            if (count >= batchSize || (now - lastFlushTime) >= flushIntervalMs) {
-                flush();
-            }
-        }
-
-        private void flush() throws SQLException {
-            if (count == 0) return;
-            ps.executeBatch();
-            count = 0;
-            lastFlushTime = System.currentTimeMillis();
-        }
-
-        @Override
-        public void snapshotState(FunctionSnapshotContext context) throws Exception {
-            flush();
-        }
-
-        @Override
-        public void initializeState(FunctionInitializationContext context) throws Exception {
-        }
-
-        @Override
-        public void finish() throws Exception {
-            if (count > 0) flush();
-        }
-
-        @Override
-        public void close() throws Exception {
-            try { if (count > 0) flush(); } catch (Exception ignored) {}
-            if (ps != null) ps.close();
-            if (conn != null) conn.close();
-        }
-    }
 
     public static void main(String[] args) throws Exception {
 
@@ -117,7 +35,7 @@ public class FeatureEngineeringJob {
         String configFile = params.get("config.file", "config.properties");
         ParameterTool config = ParameterTool.fromPropertiesFile(configFile);
 
-        String clickhouseUrl = config.get("clickhouse.url", "jdbc:clickhouse://localhost:8123/default?socket_timeout=30000&connection_timeout=10000");
+        String clickhouseUrl = config.get("clickhouse.url", "jdbc:clickhouse://localhost:8123/default?socket_timeout=60000&connection_timeout=20000");
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         String runMode = params.get("mode", "ALL").toUpperCase();
 
@@ -165,8 +83,7 @@ public class FeatureEngineeringJob {
         );
 
         if (runMode.equals("RAW") || runMode.equals("ALL")) {
-            metricsStream.addSink(new ClickHouseSinkFunction<>(
-                    clickhouseUrl,
+            metricsStream.addSink(JdbcSink.sink(
                     "INSERT INTO device_metrics (deviceId, deviceName, hostname, timestamp, " +
                             "cpuLoad, systemLoadAverage, memoryUsedPercent, memoryTotal, memoryAvailable, " +
                             "networkRxBytes, networkTxBytes, processCount, cpuTemperature) " +
@@ -186,14 +103,21 @@ public class FeatureEngineeringJob {
                         ps.setInt(12, m.processCount);
                         ps.setDouble(13, Double.isNaN(m.cpuTemperature) ? 0.0 : m.cpuTemperature);
                     },
-                    10000, 10_000L
+                    JdbcExecutionOptions.builder()
+                            .withBatchSize(2000)
+                            .withBatchIntervalMs(5000)
+                            .withMaxRetries(5)
+                            .build(),
+                    new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+                            .withUrl(clickhouseUrl)
+                            .withDriverName("com.clickhouse.jdbc.ClickHouseDriver")
+                            .build()
             )).name("ClickHouse Sink: RAW Metrics");
         }
 
         if (runMode.equals("DISK") || runMode.equals("ALL")) {
             metricsStream.flatMap(new DiskExtractor())
-                    .addSink(new ClickHouseSinkFunction<>(
-                            clickhouseUrl,
+                    .addSink(JdbcSink.sink(
                             "INSERT INTO disk_metrics (deviceId, timestamp, mountPoint, total, free, usedPercent) " +
                                     "VALUES (?, ?, ?, ?, ?, ?)",
                             (ps, fd) -> {
@@ -204,7 +128,15 @@ public class FeatureEngineeringJob {
                                 ps.setLong(5, fd.free);
                                 ps.setDouble(6, fd.usedPercent);
                             },
-                            10000, 10_000L
+                            JdbcExecutionOptions.builder()
+                                    .withBatchSize(2000)
+                                    .withBatchIntervalMs(5000)
+                                    .withMaxRetries(5)
+                                    .build(),
+                            new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+                                    .withUrl(clickhouseUrl)
+                                    .withDriverName("com.clickhouse.jdbc.ClickHouseDriver")
+                                    .build()
                     )).name("ClickHouse Sink: DISK Metrics");
         }
 
@@ -214,8 +146,7 @@ public class FeatureEngineeringJob {
                     .window(TumblingEventTimeWindows.of(Time.seconds(20)))
                     .process(new FeatureCalculator());
 
-            featuresStream.addSink(new ClickHouseSinkFunction<>(
-                    clickhouseUrl,
+            featuresStream.addSink(JdbcSink.sink(
                     "INSERT INTO metrics_features (deviceId, timestamp, avgCpuLoad, maxMemoryUsed, " +
                             "avgCpuTemp, avgNetRx, avgNetTx, avgProcesses) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (ps, f) -> {
@@ -228,7 +159,15 @@ public class FeatureEngineeringJob {
                         ps.setDouble(7, f.avgNetTx);
                         ps.setDouble(8, f.avgProcesses);
                     },
-                    10000, 10_000L
+                    JdbcExecutionOptions.builder()
+                            .withBatchSize(1000) // Фич обычно меньше, можно батч поставить поменьше
+                            .withBatchIntervalMs(5000)
+                            .withMaxRetries(5)
+                            .build(),
+                    new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+                            .withUrl(clickhouseUrl)
+                            .withDriverName("com.clickhouse.jdbc.ClickHouseDriver")
+                            .build()
             )).name("ClickHouse Sink: FEATURES");
 
             DataStream<String> jsonFeaturesStream = featuresStream.map(
