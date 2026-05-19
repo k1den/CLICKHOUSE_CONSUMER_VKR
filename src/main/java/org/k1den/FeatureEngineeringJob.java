@@ -160,7 +160,7 @@ public class FeatureEngineeringJob {
                         ps.setDouble(8, f.avgProcesses);
                     },
                     JdbcExecutionOptions.builder()
-                            .withBatchSize(1000) // Фич обычно меньше, можно батч поставить поменьше
+                            .withBatchSize(1000)
                             .withBatchIntervalMs(5000)
                             .withMaxRetries(5)
                             .build(),
