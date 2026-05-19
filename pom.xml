@@ -17,21 +17,18 @@
     </properties>
 
     <dependencies>
-        <!-- Kafka client -->
         <dependency>
             <groupId>org.apache.kafka</groupId>
             <artifactId>kafka-clients</artifactId>
             <version>3.6.0</version>
         </dependency>
 
-        <!-- Jackson (Kafka уже включает его, но явно для надежности) -->
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
             <version>2.15.2</version>
         </dependency>
 
-        <!-- ClickHouse JDBC -->
         <dependency>
             <groupId>com.clickhouse</groupId>
             <artifactId>clickhouse-jdbc</artifactId>
@@ -39,7 +36,6 @@
             <classifier>all</classifier>
         </dependency>
 
-        <!-- Для логирования -->
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-simple</artifactId>
